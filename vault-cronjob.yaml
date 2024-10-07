@@ -1,0 +1,52 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vault-snapshot-cronjob
+  namespace: vault-server
+spec:
+  schedule: "0 0 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: vault-snapshotter
+          volumes:
+          - name: gcs-credentials
+            secret:
+              secretName: gcs-credentials
+          - name: backup-dir
+            emptyDir: {}
+          containers:
+          - name: backup
+            image: vault:1.12.1
+            imagePullPolicy: IfNotPresent
+            env:
+            - name: VAULT_ADDR
+              value: http://vault-server-0.vault-server-internal:8200
+            command: ["/bin/sh", "-c"]
+            args:
+            - |
+              SA_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token);
+              export VAULT_TOKEN=$(vault write -field=token auth/kubernetes/login jwt=$SA_TOKEN role=vault-backup);
+              vault operator raft snapshot save /data/vault-raft.snap;
+              sleep 120;
+            volumeMounts:
+            - name: backup-dir
+              mountPath: /data
+          - name: snapshotupload
+            image: google/cloud-sdk:latest
+            imagePullPolicy: IfNotPresent
+            command: ["/bin/sh", "-c"]
+            args:
+            - |
+              until [ -f /data/vault-raft.snap ]; do sleep 120; done;
+              gcloud auth activate-service-account --key-file=/data/credentials/service-account.json;
+              gsutil cp /data/vault-raft.snap gs://$bucket_name/vault_raft_$(date +"%Y%m%d_%H%M%S").snap;
+            volumeMounts:
+            - name: gcs-credentials
+              mountPath: /data/credentials
+              readOnly: true
+            - name: backup-dir
+              mountPath: /data
+          restartPolicy: OnFailure
+      ttlSecondsAfterFinished: 900
